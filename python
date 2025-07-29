@@ -1,0 +1,4 @@
+#!/bin/bash
+# Wrapper script to use virtual environment Python
+source "$(dirname "$0")/venv/bin/activate"
+exec "$(dirname "$0")/venv/bin/python" "$@"
