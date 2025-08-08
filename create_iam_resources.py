@@ -191,6 +191,59 @@ def generate_unique_bucket_name(base_name):
     unique_suffix = str(uuid.uuid4())[:8]
     return f"{base_name}-{unique_suffix}"
 
+def find_existing_snapshot_bucket(s3_client, base_name="opensearch-snapshots"):
+    """Find existing S3 bucket created by previous runs"""
+    logger = logging.getLogger(__name__)
+    try:
+        logger.info("Checking for existing snapshot buckets...")
+        response = s3_client.list_buckets()
+        
+        # Look for buckets that match our naming pattern
+        matching_buckets = []
+        for bucket in response['Buckets']:
+            bucket_name = bucket['Name']
+            if bucket_name.startswith(base_name):
+                # Check if bucket has the right tags or policy to confirm it's ours
+                try:
+                    # Check bucket policy to see if it's configured for OpenSearch
+                    policy_response = s3_client.get_bucket_policy(Bucket=bucket_name)
+                    policy = json.loads(policy_response['Policy'])
+                    
+                    # Look for OpenSearch service principal in policy
+                    for statement in policy.get('Statement', []):
+                        principal = statement.get('Principal', {})
+                        if isinstance(principal, dict) and principal.get('Service') == 'opensearch.amazonaws.com':
+                            matching_buckets.append({
+                                'name': bucket_name,
+                                'creation_date': bucket['CreationDate']
+                            })
+                            break
+                except ClientError:
+                    # If we can't read the policy, skip this bucket
+                    continue
+        
+        if matching_buckets:
+            # Sort by creation date and return the most recent
+            matching_buckets.sort(key=lambda x: x['creation_date'], reverse=True)
+            latest_bucket = matching_buckets[0]
+            logger.info(f"Found existing snapshot bucket: {latest_bucket['name']} (created: {latest_bucket['creation_date']})")
+            
+            # Log info about older buckets that could be cleaned up
+            if len(matching_buckets) > 1:
+                logger.info(f"Found {len(matching_buckets) - 1} older snapshot buckets that could be cleaned up:")
+                for old_bucket in matching_buckets[1:]:
+                    logger.info(f"  - {old_bucket['name']} (created: {old_bucket['creation_date']})")
+                logger.info("Consider running the cleanup script to remove unused buckets")
+            
+            return latest_bucket['name']
+        else:
+            logger.info("No existing snapshot buckets found")
+            return None
+            
+    except ClientError as e:
+        logger.warning(f"Could not list buckets: {e}")
+        return None
+
 def parse_arguments():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(
@@ -240,23 +293,53 @@ Examples:
         help='IAM user name to create (default: OpenSearchSnapshotUser)'
     )
     
+    parser.add_argument(
+        '--force-new-bucket',
+        action='store_true',
+        help='Force creation of a new S3 bucket even if existing ones are found'
+    )
+    
     return parser.parse_args()
 
 def create_iam_role(iam_client, role_name, trust_policy, s3_policy, bucket_name, account_type):
-    """Create IAM role with necessary policies"""
+    """Create or update IAM role with necessary policies"""
     logger = logging.getLogger(__name__)
     try:
-        # Create the role
-        logger.info(f"Creating IAM role: {role_name}")
-        role_response = iam_client.create_role(
-            RoleName=role_name,
-            AssumeRolePolicyDocument=json.dumps(trust_policy),
-            Description=f"Role for OpenSearch snapshots ({account_type}) to S3 bucket {bucket_name}"
-        )
+        role_arn = None
+        role_exists = False
         
-        # Create and attach the S3 policy
+        # Check if role already exists
+        try:
+            role = iam_client.get_role(RoleName=role_name)
+            role_arn = role['Role']['Arn']
+            role_exists = True
+            logger.info(f"Role {role_name} already exists, updating policies")
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'NoSuchEntity':
+                role_exists = False
+            else:
+                raise e
+        
+        if not role_exists:
+            # Create the role
+            logger.info(f"Creating IAM role: {role_name}")
+            role_response = iam_client.create_role(
+                RoleName=role_name,
+                AssumeRolePolicyDocument=json.dumps(trust_policy),
+                Description=f"Role for OpenSearch snapshots ({account_type}) to S3 bucket {bucket_name}"
+            )
+            role_arn = role_response['Role']['Arn']
+        else:
+            # Update trust policy if role exists
+            logger.info(f"Updating trust policy for existing role: {role_name}")
+            iam_client.update_assume_role_policy(
+                RoleName=role_name,
+                PolicyDocument=json.dumps(trust_policy)
+            )
+        
+        # Create/update the S3 policy (this will overwrite existing policy with same name)
         policy_name = f"{role_name}S3Policy"
-        logger.info(f"Creating and attaching policy: {policy_name}")
+        logger.info(f"Creating/updating policy: {policy_name} for bucket {bucket_name}")
         
         iam_client.put_role_policy(
             RoleName=role_name,
@@ -264,31 +347,68 @@ def create_iam_role(iam_client, role_name, trust_policy, s3_policy, bucket_name,
             PolicyDocument=json.dumps(s3_policy)
         )
         
-        logger.info(f"Successfully created role: {role_name}")
-        return role_response['Role']['Arn']
+        logger.info(f"Successfully {'created' if not role_exists else 'updated'} role: {role_name}")
+        return role_arn
         
     except ClientError as e:
-        if e.response['Error']['Code'] == 'EntityAlreadyExists':
-            logger.warning(f"Role {role_name} already exists")
-            # Get existing role ARN
-            role = iam_client.get_role(RoleName=role_name)
-            return role['Role']['Arn']
-        else:
-            logger.error(f"Error creating role {role_name}: {e}")
-            return None
+        logger.error(f"Error creating/updating role {role_name}: {e}")
+        return None
 
 def create_iam_user(iam_client, user_name, role_arn):
-    """Create IAM user with policy to assume the snapshot role"""
+    """Create or update IAM user with policy to assume the snapshot role"""
     logger = logging.getLogger(__name__)
     try:
-        # Create the user
-        logger.info(f"Creating IAM user: {user_name}")
-        user_response = iam_client.create_user(
-            UserName=user_name,
-            Path='/',
-        )
+        user_arn = None
+        user_exists = False
+        access_keys = None
         
-        # Create policy to assume the role
+        # Check if user already exists
+        try:
+            user = iam_client.get_user(UserName=user_name)
+            user_arn = user['User']['Arn']
+            user_exists = True
+            logger.info(f"User {user_name} already exists, updating policies")
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'NoSuchEntity':
+                user_exists = False
+            else:
+                raise e
+        
+        if not user_exists:
+            # Create the user
+            logger.info(f"Creating IAM user: {user_name}")
+            user_response = iam_client.create_user(
+                UserName=user_name,
+                Path='/',
+            )
+            user_arn = user_response['User']['Arn']
+            
+            # Create access keys for new user
+            logger.info(f"Creating access keys for user: {user_name}")
+            keys_response = iam_client.create_access_key(UserName=user_name)
+            access_keys = {
+                'AccessKeyId': keys_response['AccessKey']['AccessKeyId'],
+                'SecretAccessKey': keys_response['AccessKey']['SecretAccessKey']
+            }
+        else:
+            # For existing users, check if they have access keys
+            try:
+                keys_list = iam_client.list_access_keys(UserName=user_name)
+                if keys_list['AccessKeyMetadata']:
+                    logger.info(f"User {user_name} already has access keys")
+                    access_keys = {'AccessKeyId': 'EXISTING', 'SecretAccessKey': 'EXISTING'}
+                else:
+                    logger.info(f"Creating new access keys for existing user: {user_name}")
+                    keys_response = iam_client.create_access_key(UserName=user_name)
+                    access_keys = {
+                        'AccessKeyId': keys_response['AccessKey']['AccessKeyId'],
+                        'SecretAccessKey': keys_response['AccessKey']['SecretAccessKey']
+                    }
+            except ClientError as e:
+                logger.warning(f"Could not check/create access keys for {user_name}: {e}")
+                access_keys = {'AccessKeyId': 'ERROR', 'SecretAccessKey': 'ERROR'}
+        
+        # Create/update policy to assume the role (this will overwrite existing policy with same name)
         assume_role_policy = {
             "Version": "2012-10-17",
             "Statement": [
@@ -301,7 +421,7 @@ def create_iam_user(iam_client, user_name, role_arn):
         }
         
         policy_name = f"{user_name}AssumeRolePolicy"
-        logger.info(f"Creating and attaching policy: {policy_name}")
+        logger.info(f"Creating/updating policy: {policy_name}")
         
         iam_client.put_user_policy(
             UserName=user_name,
@@ -309,25 +429,17 @@ def create_iam_user(iam_client, user_name, role_arn):
             PolicyDocument=json.dumps(assume_role_policy)
         )
         
-        # Create access keys
-        logger.info(f"Creating access keys for user: {user_name}")
-        keys_response = iam_client.create_access_key(UserName=user_name)
+        logger.info(f"Successfully {'created' if not user_exists else 'updated'} user: {user_name}")
         
-        logger.info(f"Successfully created user: {user_name}")
-        return {
-            'UserArn': user_response['User']['Arn'],
-            'AccessKeyId': keys_response['AccessKey']['AccessKeyId'],
-            'SecretAccessKey': keys_response['AccessKey']['SecretAccessKey']
-        }
+        result = {'UserArn': user_arn}
+        if access_keys:
+            result.update(access_keys)
+        
+        return result
         
     except ClientError as e:
-        if e.response['Error']['Code'] == 'EntityAlreadyExists':
-            logger.warning(f"User {user_name} already exists")
-            user = iam_client.get_user(UserName=user_name)
-            return {'UserArn': user['User']['Arn']}
-        else:
-            logger.error(f"Error creating user {user_name}: {e}")
-            return None
+        logger.error(f"Error creating/updating user {user_name}: {e}")
+        return None
 
 def main():
     logger = setup_logging()
@@ -358,24 +470,33 @@ def main():
             s3_info = parse_s3_arn(args.s3_bucket)
             logger.info(f"Using existing S3 bucket: {s3_info['name']} in {s3_info['region']}")
         else:
-            logger.info("Creating new S3 bucket")
+            logger.info("Looking for existing S3 bucket or creating new one")
             base_bucket_name = "opensearch-snapshots"
             bucket_region = source_info['region']  # Create in source region
             s3_client = boto3.client('s3', region_name=bucket_region)
             
-            # Try up to 5 times to create a bucket with unique name
-            max_attempts = 5
-            bucket_created = False
+            # First, try to find an existing bucket (unless forced to create new)
+            existing_bucket = None if args.force_new_bucket else find_existing_snapshot_bucket(s3_client, base_bucket_name)
             
-            for attempt in range(max_attempts):
-                bucket_name = generate_unique_bucket_name(base_bucket_name)
-                logger.info(f"Attempt {attempt + 1}/{max_attempts}: Trying bucket name {bucket_name}")
+            if existing_bucket and not args.force_new_bucket:
+                logger.info(f"Reusing existing S3 bucket: {existing_bucket}")
+                bucket_name = existing_bucket
+                bucket_created = True
+            else:
+                logger.info("No existing bucket found, creating new S3 bucket")
+                # Try up to 5 times to create a bucket with unique name
+                max_attempts = 5
+                bucket_created = False
                 
-                if create_s3_bucket(s3_client, bucket_name, bucket_region):
-                    bucket_created = True
-                    break
-                else:
-                    logger.warning(f"Bucket name {bucket_name} not available, trying another")
+                for attempt in range(max_attempts):
+                    bucket_name = generate_unique_bucket_name(base_bucket_name)
+                    logger.info(f"Attempt {attempt + 1}/{max_attempts}: Trying bucket name {bucket_name}")
+                    
+                    if create_s3_bucket(s3_client, bucket_name, bucket_region):
+                        bucket_created = True
+                        break
+                    else:
+                        logger.warning(f"Bucket name {bucket_name} not available, trying another")
             
             if not bucket_created:
                 logger.error("Failed to create S3 bucket after multiple attempts")
@@ -387,7 +508,7 @@ def main():
                 'account_id': source_info['account_id'],
                 'arn': f"arn:aws:s3:::{bucket_name}"
             }
-            logger.info(f"Created S3 Bucket: {s3_info['name']} in {s3_info['region']}")
+            logger.info(f"Using S3 Bucket: {s3_info['name']} in {s3_info['region']}")
         
     except ValueError as e:
         logger.error(f"Error parsing ARNs: {e}")
@@ -455,7 +576,7 @@ def main():
         }
         
         additional_policy_name = f"{source_user_name}OpenSearchPolicy"
-        logger.info(f"Creating additional policy for source user: {additional_policy_name}")
+        logger.info(f"Creating/updating additional policy for source user: {additional_policy_name}")
         
         try:
             source_iam.put_user_policy(
@@ -463,9 +584,9 @@ def main():
                 PolicyName=additional_policy_name,
                 PolicyDocument=json.dumps(source_additional_policy)
             )
-            logger.info(f"Successfully attached OpenSearch policy to user: {source_user_name}")
+            logger.info(f"Successfully attached/updated OpenSearch policy to user: {source_user_name}")
         except ClientError as e:
-            logger.warning(f"Could not attach OpenSearch policy to user {source_user_name}: {e}")
+            logger.warning(f"Could not attach/update OpenSearch policy to user {source_user_name}: {e}")
         
     except Exception as e:
         logger.error(f"Error processing source account: {e}")
@@ -550,17 +671,25 @@ def main():
     with open('iam_resources_output.json', 'w') as f:
         json.dump(output, f, indent=2)
     
-    logger.info("IAM resources created successfully!")
+    logger.info("=== IAM resources setup completed successfully! ===")
     logger.info(f"Complete configuration saved to: iam_resources_output.json")
     logger.info(f"S3 bucket: {s3_info['name']} ({s3_info['arn']})")
     logger.info(f"Source Account Resources - Role: {source_role_name} ({source_role_arn})")
     logger.info(f"Source Account Resources - User: {source_user_name}")
     logger.info(f"Destination Account Resources - Role: {dest_role_name} ({dest_role_arn})")
     logger.info(f"Destination Account Resources - User: {dest_user_name}")
-    logger.info("IMPORTANT: Store the access keys securely and delete them from the output file after use!")
-    logger.info("Next steps: 1. Set up S3 bucket replication if cross-region")
-    logger.info("Next steps: 2. Configure OpenSearch snapshot repositories using the respective roles")
-    logger.info("Next steps: 3. Test snapshot creation and restoration")
+    logger.info("")
+    logger.info("IMPORTANT NOTES:")
+    logger.info("- IAM policies have been updated to reference the current S3 bucket")
+    logger.info("- Existing resources were updated rather than creating duplicates")
+    logger.info("- Store access keys securely and delete them from the output file after use!")
+    logger.info("- If you see 'EXISTING' for access keys, the user already had keys - check AWS console")
+    logger.info("")
+    logger.info("NEXT STEPS:")
+    logger.info("1. Set up S3 bucket replication if cross-region")
+    logger.info("2. Configure OpenSearch snapshot repositories using the respective roles")
+    logger.info("3. Test snapshot creation and restoration")
+    logger.info("4. Consider cleaning up old unused S3 buckets if any were reported")
 
 if __name__ == "__main__":
     main()
