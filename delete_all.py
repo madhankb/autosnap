@@ -18,6 +18,8 @@ from botocore.exceptions import ClientError
 import sys
 import argparse
 import logging
+import signal
+import time
 from datetime import datetime
 from urllib.parse import urljoin
 import urllib3
@@ -92,19 +94,107 @@ def create_security_session(endpoint, username=None, password=None):
     
     return session
 
-def delete_snapshot_repository(config, username, password, dry_run=False):
-    """Delete snapshot repository from OpenSearch"""
+def test_opensearch_connection(session, endpoint, dry_run=False):
+    """Test connection to OpenSearch Security API"""
     logger = logging.getLogger(__name__)
     
-    logger.info("=== Deleting Snapshot Repository ===")
+    if dry_run:
+        logger.info("[DRY RUN] Would test OpenSearch connection")
+        return True
+    
+    try:
+        url = urljoin(endpoint, "_plugins/_security/api/account")
+        logger.debug(f"Testing connection to: {url}")
+        response = session.get(url, verify=False)
+        
+        if response.status_code == 200:
+            logger.debug("OpenSearch connection test successful")
+            return True
+        else:
+            logger.error(f"OpenSearch connection test failed: {response.status_code}")
+            logger.debug(f"Connection test response: {response.text}")
+            
+            if response.status_code == 403:
+                logger.error("PERMISSION DENIED - User may not have security API access")
+            elif response.status_code == 401:
+                logger.error("AUTHENTICATION FAILED - Check username/password")
+            
+            return False
+            
+    except Exception as e:
+        logger.error(f"Exception testing OpenSearch connection: {e}")
+        return False
+
+def delete_all_snapshots(session, endpoint, repo_name, dry_run=False):
+    """Delete all snapshots in the repository"""
+    logger = logging.getLogger(__name__)
     
     if dry_run:
-        logger.info("[DRY RUN] Would delete snapshot repository: automated-snapshots")
+        logger.info(f"[DRY RUN] Would delete all snapshots in repository: {repo_name}")
+        return True
+    
+    try:
+        # Get list of all snapshots
+        url = urljoin(endpoint, f"_snapshot/{repo_name}/_all")
+        logger.debug(f"Getting list of snapshots from: {url}")
+        
+        response = session.get(url, verify=False)
+        
+        if response.status_code == 404:
+            logger.info(f"Repository {repo_name} does not exist, no snapshots to delete")
+            return True
+        elif response.status_code != 200:
+            logger.warning(f"Could not list snapshots: {response.status_code}")
+            logger.debug(f"Snapshot list response: {response.text}")
+            return True  # Continue anyway
+        
+        snapshot_data = response.json()
+        snapshots = snapshot_data.get('snapshots', [])
+        
+        if not snapshots:
+            logger.info(f"No snapshots found in repository {repo_name}")
+            return True
+        
+        logger.info(f"Found {len(snapshots)} snapshots to delete")
+        
+        # Delete each snapshot
+        deleted_count = 0
+        for snapshot in snapshots:
+            snapshot_name = snapshot.get('snapshot', 'unknown')
+            logger.info(f"Deleting snapshot: {snapshot_name}")
+            
+            delete_url = urljoin(endpoint, f"_snapshot/{repo_name}/{snapshot_name}")
+            delete_response = session.delete(delete_url, verify=False)
+            
+            if delete_response.status_code in [200, 404]:
+                logger.info(f"Successfully deleted snapshot: {snapshot_name}")
+                deleted_count += 1
+            else:
+                logger.warning(f"Failed to delete snapshot {snapshot_name}: {delete_response.status_code}")
+                logger.debug(f"Delete response: {delete_response.text}")
+        
+        logger.info(f"Deleted {deleted_count}/{len(snapshots)} snapshots")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Exception deleting snapshots: {e}")
+        logger.debug(f"Exception details: {str(e)}", exc_info=True)
+        return False
+
+def delete_snapshot_repository(config, username, password, dry_run=False):
+    """Delete all snapshots and then the snapshot repository from OpenSearch"""
+    logger = logging.getLogger(__name__)
+    
+    logger.info("=== Deleting Snapshots and Repository ===")
+    
+    repo_name = config.get('repository_name', 'automated-snapshots')
+    if dry_run:
+        logger.info(f"[DRY RUN] Would delete all snapshots and repository: {repo_name}")
         return True
     
     if not username or not password:
-        logger.warning("Cannot delete repository without OpenSearch credentials")
-        logger.warning("Repository may still exist and need manual deletion")
+        logger.warning("Cannot delete snapshots/repository without OpenSearch credentials")
+        logger.warning("Snapshots and repository may still exist and need manual deletion")
         return True
     
     try:
@@ -116,8 +206,36 @@ def delete_snapshot_repository(config, username, password, dry_run=False):
         logger.debug(f"Source endpoint: {source_endpoint}")
         session = create_security_session(source_endpoint, username, password)
         
-        repo_name = "automated-snapshots"
+        # Test connection first
+        logger.debug("Testing OpenSearch connection...")
+        if not test_opensearch_connection(session, source_endpoint, dry_run):
+            logger.error("Cannot connect to OpenSearch - deletion may fail")
+            if not dry_run:
+                logger.warning("Continuing anyway, but expect failures...")
+        
+        repo_name = config.get('repository_name', 'automated-snapshots')
+        
+        # Step 1: Delete all snapshots first
+        logger.info(f"Step 1: Deleting all snapshots in repository {repo_name}")
+        delete_all_snapshots(session, source_endpoint, repo_name, dry_run)
+        
+        # Step 2: Delete the repository
+        logger.info(f"Step 2: Deleting repository {repo_name}")
         url = urljoin(source_endpoint, f"_snapshot/{repo_name}")
+        
+        # Check if repository exists
+        logger.debug(f"Checking if repository exists: {url}")
+        check_response = session.get(url, verify=False)
+        
+        if check_response.status_code == 404:
+            logger.info(f"Snapshot repository {repo_name} does not exist (already deleted)")
+            return True
+        elif check_response.status_code != 200:
+            logger.warning(f"Could not check repository status: {check_response.status_code}")
+            logger.debug(f"Repository check response: {check_response.text}")
+            # Continue with deletion attempt anyway
+        else:
+            logger.debug(f"Repository {repo_name} exists, proceeding with deletion")
         
         logger.debug(f"Deleting repository at: {url}")
         response = session.delete(url, verify=False)
@@ -130,11 +248,40 @@ def delete_snapshot_repository(config, username, password, dry_run=False):
             return True
         else:
             logger.error(f"Failed to delete repository: {response.status_code}")
-            logger.debug(f"Error response: {response.text}")
+            logger.error(f"Error response: {response.text}")
+            
+            # Provide specific error guidance
+            if response.status_code == 403:
+                logger.error("PERMISSION DENIED - This is likely due to:")
+                logger.error("- Incorrect OpenSearch username/password")
+                logger.error("- User doesn't have snapshot management permissions")
+                logger.error("- OpenSearch security configuration issues")
+                logger.error("SUGGESTION: Check that the user has 'manage_snapshots' role")
+            elif response.status_code == 401:
+                logger.error("AUTHENTICATION FAILED - Check username/password")
+            elif response.status_code == 500:
+                logger.error("INTERNAL SERVER ERROR - OpenSearch may have issues")
+                logger.error("SUGGESTION: Check OpenSearch cluster health")
+            
+            # Try to parse error details
+            try:
+                error_data = response.json()
+                if 'error' in error_data:
+                    error_info = error_data['error']
+                    if isinstance(error_info, dict):
+                        error_type = error_info.get('type', 'unknown')
+                        error_reason = error_info.get('reason', 'unknown')
+                        logger.error(f"Error type: {error_type}")
+                        logger.error(f"Error reason: {error_reason}")
+                    else:
+                        logger.error(f"Error details: {error_info}")
+            except:
+                logger.error("Could not parse error response as JSON")
+            
             return False
             
     except Exception as e:
-        logger.error(f"Exception deleting snapshot repository: {e}")
+        logger.error(f"Exception deleting snapshots and repository: {e}")
         logger.debug(f"Exception details: {str(e)}", exc_info=True)
         return False
 
@@ -336,11 +483,9 @@ def revert_opensearch_security(config, username, password, dry_run=False):
         session = create_security_session(source_endpoint, username, password)
         
         # Test connection
-        test_url = urljoin(source_endpoint, "_plugins/_security/api/account")
-        test_response = session.get(test_url, verify=False)
-        
-        if test_response.status_code != 200:
-            logger.error(f"Failed to connect to OpenSearch Security API: {test_response.status_code}")
+        logger.debug("Testing OpenSearch connection for security operations...")
+        if not test_opensearch_connection(session, source_endpoint, dry_run):
+            logger.error("Cannot connect to OpenSearch Security API")
             return False
         
         success_count = 0
@@ -386,58 +531,157 @@ def revert_opensearch_security(config, username, password, dry_run=False):
         logger.debug(f"Exception details: {str(e)}", exc_info=True)
         return False
 
-def delete_s3_bucket(s3_client, bucket_name, dry_run=False):
-    """Delete S3 bucket and all its contents"""
+class TimeoutError(Exception):
+    pass
+
+def timeout_handler(signum, frame):
+    raise TimeoutError("Operation timed out")
+
+def delete_s3_bucket_contents_with_timeout(s3_client, bucket_name, timeout_minutes=30, dry_run=False):
+    """Delete all contents from S3 bucket with timeout protection"""
     logger = logging.getLogger(__name__)
     
     if dry_run:
-        logger.info(f"[DRY RUN] Would delete S3 bucket: {bucket_name}")
-        logger.debug("[DRY RUN] Would delete all objects and versions")
+        logger.info(f"[DRY RUN] Would delete all contents from S3 bucket: {bucket_name}")
+        return True
+    
+    # Set up timeout handler
+    signal.signal(signal.SIGALRM, timeout_handler)
+    signal.alarm(timeout_minutes * 60)  # Set timeout in seconds
+    
+    try:
+        logger.info(f"Step 1: Deleting all contents from S3 bucket: {bucket_name} (timeout: {timeout_minutes} minutes)")
+        result = delete_s3_bucket_contents(s3_client, bucket_name, dry_run)
+        signal.alarm(0)  # Cancel the alarm
+        return result
+    except TimeoutError:
+        signal.alarm(0)  # Cancel the alarm
+        logger.error(f"S3 bucket content deletion timed out after {timeout_minutes} minutes")
+        logger.error("The bucket may have too many objects/versions. Consider:")
+        logger.error("1. Running the script again (it will continue from where it left off)")
+        logger.error("2. Manually emptying the bucket using AWS Console")
+        logger.error("3. Using AWS CLI: aws s3 rm s3://{bucket_name} --recursive")
+        return False
+    except Exception as e:
+        signal.alarm(0)  # Cancel the alarm
+        logger.error(f"Error during S3 bucket content deletion: {e}")
+        return False
+
+def delete_s3_bucket_contents(s3_client, bucket_name, dry_run=False):
+    """Delete all contents from S3 bucket (objects and versions)"""
+    logger = logging.getLogger(__name__)
+    
+    if dry_run:
+        logger.info(f"[DRY RUN] Would delete all contents from S3 bucket: {bucket_name}")
         return True
     
     try:
-        logger.info(f"Deleting S3 bucket: {bucket_name}")
+        logger.info(f"Step 1: Deleting all contents from S3 bucket: {bucket_name}")
         
-        # First, delete all objects in the bucket
-        logger.debug(f"Deleting all objects in bucket: {bucket_name}")
-        try:
-            # List and delete all objects
-            paginator = s3_client.get_paginator('list_objects_v2')
-            pages = paginator.paginate(Bucket=bucket_name)
-            
-            for page in pages:
-                if 'Contents' in page:
-                    objects = [{'Key': obj['Key']} for obj in page['Contents']]
-                    if objects:
+        # Delete all current objects
+        logger.info("Deleting current objects...")
+        paginator = s3_client.get_paginator('list_objects_v2')
+        pages = paginator.paginate(Bucket=bucket_name)
+        
+        total_objects = 0
+        batch_count = 0
+        for page in pages:
+            if 'Contents' in page:
+                objects = [{'Key': obj['Key']} for obj in page['Contents']]
+                if objects:
+                    # Process in smaller batches to avoid timeouts
+                    batch_size = 1000  # AWS limit is 1000 objects per delete request
+                    for i in range(0, len(objects), batch_size):
+                        batch = objects[i:i + batch_size]
                         s3_client.delete_objects(
                             Bucket=bucket_name,
-                            Delete={'Objects': objects}
+                            Delete={'Objects': batch, 'Quiet': True}  # Quiet mode for better performance
                         )
-                        logger.debug(f"Deleted {len(objects)} objects from bucket")
-            
-            # Delete all object versions (if versioning is enabled)
-            version_paginator = s3_client.get_paginator('list_object_versions')
-            version_pages = version_paginator.paginate(Bucket=bucket_name)
-            
-            for page in version_pages:
-                versions = []
-                if 'Versions' in page:
-                    versions.extend([{'Key': v['Key'], 'VersionId': v['VersionId']} for v in page['Versions']])
-                if 'DeleteMarkers' in page:
-                    versions.extend([{'Key': d['Key'], 'VersionId': d['VersionId']} for d in page['DeleteMarkers']])
-                
-                if versions:
-                    s3_client.delete_objects(
-                        Bucket=bucket_name,
-                        Delete={'Objects': versions}
-                    )
-                    logger.debug(f"Deleted {len(versions)} object versions from bucket")
+                        total_objects += len(batch)
+                        batch_count += 1
+                        if batch_count % 10 == 0:  # Progress update every 10 batches
+                            logger.info(f"Progress: Deleted {total_objects} current objects so far...")
         
-        except ClientError as e:
-            if e.response['Error']['Code'] != 'NoSuchBucket':
-                logger.warning(f"Error deleting objects from bucket {bucket_name}: {e}")
+        if total_objects > 0:
+            logger.info(f"Deleted {total_objects} current objects")
+        else:
+            logger.info("No current objects found to delete")
         
-        # Now delete the bucket
+        # Delete all object versions and delete markers (if versioning is enabled)
+        logger.info("Deleting object versions and delete markers...")
+        version_paginator = s3_client.get_paginator('list_object_versions')
+        version_pages = version_paginator.paginate(Bucket=bucket_name)
+        
+        total_versions = 0
+        version_batch_count = 0
+        for page in version_pages:
+            versions = []
+            if 'Versions' in page:
+                versions.extend([{'Key': v['Key'], 'VersionId': v['VersionId']} for v in page['Versions']])
+            if 'DeleteMarkers' in page:
+                versions.extend([{'Key': d['Key'], 'VersionId': d['VersionId']} for d in page['DeleteMarkers']])
+            
+            if versions:
+                # Process in smaller batches to avoid timeouts
+                batch_size = 1000  # AWS limit is 1000 objects per delete request
+                for i in range(0, len(versions), batch_size):
+                    batch = versions[i:i + batch_size]
+                    try:
+                        s3_client.delete_objects(
+                            Bucket=bucket_name,
+                            Delete={'Objects': batch, 'Quiet': True}  # Quiet mode for better performance
+                        )
+                        total_versions += len(batch)
+                        version_batch_count += 1
+                        if version_batch_count % 10 == 0:  # Progress update every 10 batches
+                            logger.info(f"Progress: Deleted {total_versions} object versions so far...")
+                    except ClientError as e:
+                        logger.warning(f"Error deleting version batch: {e}")
+                        # Continue with next batch
+                        continue
+        
+        if total_versions > 0:
+            logger.info(f"Deleted {total_versions} object versions and delete markers")
+        else:
+            logger.info("No object versions or delete markers found to delete")
+        
+        logger.info("Successfully deleted all bucket contents")
+        return True
+        
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchBucket':
+            logger.warning(f"S3 bucket {bucket_name} does not exist")
+            return True
+        else:
+            logger.error(f"Error deleting contents from bucket {bucket_name}: {e}")
+            logger.debug(f"S3 error details: {str(e)}", exc_info=True)
+            return False
+    except Exception as e:
+        logger.error(f"Unexpected error deleting bucket contents: {e}")
+        logger.debug(f"Exception details: {str(e)}", exc_info=True)
+        return False
+
+def delete_s3_bucket_with_timeout(s3_client, bucket_name, timeout_minutes=30, dry_run=False):
+    """Delete S3 bucket with timeout protection"""
+    logger = logging.getLogger(__name__)
+    
+    if dry_run:
+        logger.info(f"[DRY RUN] Would delete S3 bucket contents and bucket: {bucket_name}")
+        return True
+    
+    try:
+        # Step 1: Delete all bucket contents with timeout protection
+        if not delete_s3_bucket_contents_with_timeout(s3_client, bucket_name, timeout_minutes, dry_run):
+            logger.error("Failed to delete bucket contents, cannot proceed with bucket deletion")
+            logger.error("You can:")
+            logger.error("1. Run the script again to continue deletion")
+            logger.error("2. Manually empty the bucket and run the script again")
+            logger.error("3. Skip S3 deletion with --skip-s3 flag")
+            logger.error(f"4. Increase timeout with --s3-timeout {timeout_minutes * 2}")
+            return False
+        
+        # Step 2: Delete the empty bucket
+        logger.info(f"Step 2: Deleting empty S3 bucket: {bucket_name}")
         s3_client.delete_bucket(Bucket=bucket_name)
         logger.info(f"Successfully deleted S3 bucket: {bucket_name}")
         return True
@@ -446,6 +690,47 @@ def delete_s3_bucket(s3_client, bucket_name, dry_run=False):
         if e.response['Error']['Code'] == 'NoSuchBucket':
             logger.warning(f"S3 bucket {bucket_name} does not exist")
             return True
+        elif e.response['Error']['Code'] == 'BucketNotEmpty':
+            logger.error(f"S3 bucket {bucket_name} is not empty - content deletion may have failed")
+            logger.error("Try running the script again or manually empty the bucket")
+            return False
+        else:
+            logger.error(f"Error deleting S3 bucket {bucket_name}: {e}")
+            logger.debug(f"S3 error details: {str(e)}", exc_info=True)
+            return False
+
+def delete_s3_bucket(s3_client, bucket_name, dry_run=False):
+    """Delete S3 bucket contents first, then delete the bucket itself"""
+    logger = logging.getLogger(__name__)
+    
+    if dry_run:
+        logger.info(f"[DRY RUN] Would delete S3 bucket contents and bucket: {bucket_name}")
+        return True
+    
+    try:
+        # Step 1: Delete all bucket contents with timeout protection
+        if not delete_s3_bucket_contents_with_timeout(s3_client, bucket_name, timeout_minutes=30, dry_run=dry_run):
+            logger.error("Failed to delete bucket contents, cannot proceed with bucket deletion")
+            logger.error("You can:")
+            logger.error("1. Run the script again to continue deletion")
+            logger.error("2. Manually empty the bucket and run the script again")
+            logger.error("3. Skip S3 deletion with --skip-s3 flag")
+            return False
+        
+        # Step 2: Delete the empty bucket
+        logger.info(f"Step 2: Deleting empty S3 bucket: {bucket_name}")
+        s3_client.delete_bucket(Bucket=bucket_name)
+        logger.info(f"Successfully deleted S3 bucket: {bucket_name}")
+        return True
+        
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchBucket':
+            logger.warning(f"S3 bucket {bucket_name} does not exist")
+            return True
+        elif e.response['Error']['Code'] == 'BucketNotEmpty':
+            logger.error(f"S3 bucket {bucket_name} is not empty - content deletion may have failed")
+            logger.error("Try running the script again or manually empty the bucket")
+            return False
         else:
             logger.error(f"Error deleting S3 bucket {bucket_name}: {e}")
             logger.debug(f"S3 error details: {str(e)}", exc_info=True)
@@ -635,6 +920,13 @@ Examples:
         help='Enable debug logging for detailed error messages'
     )
     
+    parser.add_argument(
+        '--s3-timeout',
+        type=int,
+        default=30,
+        help='Timeout in minutes for S3 bucket content deletion (default: 30)'
+    )
+    
     return parser.parse_args()
 
 def main():
@@ -663,8 +955,10 @@ def main():
         logger.info(f"  Destination IAM Role: {config['destination']['role_name']}")
         logger.info(f"  Destination IAM User: {config['destination']['user_name']}")
     if not args.skip_opensearch:
+        repo_name = config.get('repository_name', 'automated-snapshots')
         logger.info(f"  OpenSearch Security Mappings (all_access, manage_snapshots)")
-        logger.info(f"  Snapshot Repository: automated-snapshots")
+        logger.info(f"  All Snapshots in Repository: {repo_name}")
+        logger.info(f"  Snapshot Repository: {repo_name}")
     
     log_separator()
     
@@ -683,8 +977,8 @@ def main():
     if not args.skip_opensearch:
         total_count += 2
         
-        # Delete snapshot repository
-        logger.debug("Attempting to delete snapshot repository (independent of IAM resource state)")
+        # Delete snapshots and repository
+        logger.debug("Attempting to delete snapshots and repository (independent of IAM resource state)")
         if delete_snapshot_repository(config, args.username, args.password, args.dry_run):
             success_count += 1
         log_separator()
@@ -701,7 +995,8 @@ def main():
         logger.info("=== Deleting S3 Bucket ===")
         try:
             s3_client = boto3.client('s3', region_name=config['s3_bucket']['region'])
-            if delete_s3_bucket(s3_client, config['s3_bucket']['name'], args.dry_run):
+            # Update the timeout function call
+            if delete_s3_bucket_with_timeout(s3_client, config['s3_bucket']['name'], args.s3_timeout, args.dry_run):
                 success_count += 1
         except Exception as e:
             logger.error(f"Error processing S3 bucket: {e}")

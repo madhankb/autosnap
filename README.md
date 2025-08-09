@@ -1,23 +1,25 @@
 # OpenSearch Snapshot Setup Automation
 
-This project provides a unified script that automates the complete setup for OpenSearch manual snapshots across different domains, regions, and AWS accounts. It creates IAM resources, configures OpenSearch security, and optionally registers snapshot repositories, as described in the [AWS blog post](https://aws.amazon.com/blogs/big-data/take-manual-snapshots-and-restore-in-a-different-domain-spanning-across-various-regions-and-accounts-in-amazon-opensearch-service/).
+This project provides a unified script that automates the complete setup and execution for OpenSearch manual snapshots across different domains, regions, and AWS accounts. It creates IAM resources, configures OpenSearch security, registers snapshot repositories, and takes manual snapshots, as described in the [AWS blog post](https://aws.amazon.com/blogs/big-data/take-manual-snapshots-and-restore-in-a-different-domain-spanning-across-various-regions-and-accounts-in-amazon-opensearch-service/).
 
 ## Overview
 
-The unified `opensearch_snapshot_setup.py` script handles the complete end-to-end setup:
+The unified `opensearch_snapshot_setup.py` script handles the complete end-to-end setup and snapshot creation:
 1. **IAM Resources**: Creates roles, users, and policies for both source and destination accounts
 2. **S3 Bucket Management**: Smart bucket reuse (empty buckets only) or creates new buckets
 3. **OpenSearch Security**: Configures role mappings for snapshot operations
-4. **Repository Registration**: Automatically registers the snapshot repository (can be skipped)
+4. **Repository Registration**: Automatically registers the snapshot repository with unique naming
+5. **Snapshot Creation**: Takes manual snapshots immediately after setup (optional)
 
 ## Features
 
-- ✅ **Unified Setup**: Single script handles IAM, security, and repository setup
+- ✅ **Complete End-to-End Solution**: Single script handles IAM, security, repository setup, and snapshot creation
 - ✅ **Cross-account support**: Works across different AWS accounts
 - ✅ **Cross-region support**: Handles different AWS regions
 - ✅ **Smart S3 bucket management**: Reuses empty buckets or creates new ones
 - ✅ **OpenSearch security configuration**: Automatically configures role mappings
-- ✅ **Repository registration**: Automatically registers snapshot repositories
+- ✅ **Unique repository naming**: Generates random repository names (`manualsnap-repo-<4chars>`)
+- ✅ **Integrated snapshot creation**: Takes manual snapshots immediately after setup
 - ✅ **Secure IAM policies**: Implements least-privilege access with proper conditions
 - ✅ **Comprehensive logging**: Clean output with optional debug mode
 - ✅ **Dry-run mode**: Preview what will be created without making changes
@@ -45,7 +47,7 @@ The unified `opensearch_snapshot_setup.py` script handles the complete end-to-en
 ### Basic Usage
 
 ```bash
-# Complete setup (IAM + Security + Repository) with automatic S3 bucket management
+# Complete setup and snapshot creation (IAM + Security + Repository + Snapshot)
 python opensearch_snapshot_setup.py \
   --src-domain "arn:aws:es:us-east-1:111111111111:domain/source-domain" \
   --dest-domain "arn:aws:es:us-west-2:222222222222:domain/dest-domain" \
@@ -64,6 +66,13 @@ python opensearch_snapshot_setup.py \
   --dest-domain "arn:aws:es:us-west-2:222222222222:domain/dest-domain" \
   --s3 "arn:aws:s3:::my-snapshots-bucket" \
   --username admin --password mypassword
+
+# Setup only (skip snapshot creation)
+python opensearch_snapshot_setup.py \
+  --src-domain "arn:aws:es:us-east-1:111111111111:domain/source-domain" \
+  --dest-domain "arn:aws:es:us-west-2:222222222222:domain/dest-domain" \
+  --username admin --password mypassword \
+  --skip-snapshot
 ```
 
 ### Advanced Usage
@@ -75,6 +84,27 @@ python opensearch_snapshot_setup.py \
   --dest-domain "arn:aws:es:us-west-2:222222222222:domain/dest-domain" \
   --username admin --password mypassword \
   --skip-repository
+
+# Skip snapshot creation (setup only)
+python opensearch_snapshot_setup.py \
+  --src-domain "arn:aws:es:us-east-1:111111111111:domain/source-domain" \
+  --dest-domain "arn:aws:es:us-west-2:222222222222:domain/dest-domain" \
+  --username admin --password mypassword \
+  --skip-snapshot
+
+# Custom snapshot name
+python opensearch_snapshot_setup.py \
+  --src-domain "arn:aws:es:us-east-1:111111111111:domain/source-domain" \
+  --dest-domain "arn:aws:es:us-west-2:222222222222:domain/dest-domain" \
+  --username admin --password mypassword \
+  --snapshot-name "backup-before-upgrade"
+
+# Snapshot specific indices only
+python opensearch_snapshot_setup.py \
+  --src-domain "arn:aws:es:us-east-1:111111111111:domain/source-domain" \
+  --dest-domain "arn:aws:es:us-west-2:222222222222:domain/dest-domain" \
+  --username admin --password mypassword \
+  --indices "index1,index2,index3"
 
 # Force new bucket creation every run
 python opensearch_snapshot_setup.py \
@@ -102,13 +132,6 @@ python opensearch_snapshot_setup.py \
   --src-domain "arn:aws:es:us-east-1:111111111111:domain/source-domain" \
   --dest-domain "arn:aws:es:us-west-2:222222222222:domain/dest-domain" \
   --skip-security
-
-# Skip only repository registration (do IAM and security)
-python opensearch_snapshot_setup.py \
-  --src-domain "arn:aws:es:us-east-1:111111111111:domain/source-domain" \
-  --dest-domain "arn:aws:es:us-west-2:222222222222:domain/dest-domain" \
-  --username admin --password mypassword \
-  --skip-repository
 ```
 
 ### Command Line Options
@@ -126,6 +149,10 @@ python opensearch_snapshot_setup.py \
 | `--force-new-bucket` | No | Force creation of new S3 bucket | `False` |
 | `--skip-security` | No | Skip OpenSearch security configuration | `False` |
 | `--skip-repository` | No | Skip snapshot repository registration | `False` |
+| `--skip-snapshot` | No | Skip snapshot creation (setup only) | `False` |
+| `--snapshot-name` | No | Custom snapshot name (auto-generated if not provided) | - |
+| `--indices` | No | Comma-separated list of indices to snapshot | All indices |
+| `--timeout` | No | Snapshot timeout in minutes | `60` |
 | `--dry-run` | No | Show what would be done without making changes | `False` |
 | `--debug` | No | Enable detailed debug logging | `False` |
 | `--help` | No | Show help message | - |
@@ -138,6 +165,12 @@ python opensearch_snapshot_setup.py \
 - **Name**: `opensearch-snapshots-{8-char-uuid}`
 - **Location**: Source account and region
 - **Features**: Versioning enabled, OpenSearch service access policy
+
+### Snapshot Repository
+- **Name**: `manualsnap-repo-{4-random-chars}` (e.g., `manualsnap-repo-a7b2`)
+- **Type**: S3-based repository
+- **Configuration**: Automatically registered in source domain
+- **Shared**: Same repository name used across all scripts
 
 ### Source Account Resources
 - **IAM Role**: `{role-name}-src` (default: `OpenSearchSnapshotRole-src`)
@@ -154,9 +187,15 @@ python opensearch_snapshot_setup.py \
   - S3 access policy for snapshot operations
   - AssumeRole policy for user
 
+### Manual Snapshot (if not skipped)
+- **Name**: Auto-generated with timestamp (e.g., `manual-snapshot-20250109-143022`)
+- **Repository**: Uses the generated repository name
+- **Indices**: All indices by default, or specified indices
+- **Status**: Monitored until completion
+
 ### Output File
 - **File**: `opensearch_snapshot_config.json`
-- **Contains**: All ARNs, credentials, and configuration details for both accounts
+- **Contains**: All ARNs, credentials, repository name, and configuration details for both accounts
 
 ## Security Features
 
@@ -233,16 +272,24 @@ python opensearch_snapshot_setup.py \
 2025-07-29 19:24:48 - INFO - Configured manage_snapshots role mapping
 ------------------------------------------------------------
 2025-07-29 19:24:48 - INFO - === Registering Snapshot Repository ===
-2025-07-29 19:24:49 - INFO - Successfully registered snapshot repository: automated-snapshots
+2025-07-29 19:24:49 - INFO - Successfully registered snapshot repository: manualsnap-repo-a7b2
 ------------------------------------------------------------
-2025-07-29 19:24:48 - INFO - === Setup Summary ===
-2025-07-29 19:24:48 - INFO - S3 bucket: opensearch-snapshots-8cc57667
-2025-07-29 19:24:48 - INFO - Source role: OpenSearchSnapshotRole-src
-2025-07-29 19:24:48 - INFO - Source user: OpenSearchSnapshotUser-src
-2025-07-29 19:24:48 - INFO - Destination role: OpenSearchSnapshotRole-dest
-2025-07-29 19:24:48 - INFO - Destination user: OpenSearchSnapshotUser-dest
+2025-07-29 19:24:49 - INFO - === Creating Manual Snapshot ===
+2025-07-29 19:24:50 - INFO - Creating snapshot: manualsnap-repo-a7b2/manual-snapshot-20250109-143022
+2025-07-29 19:24:51 - INFO - Snapshot initiated successfully (Task ID: abc123)
+2025-07-29 19:24:51 - INFO - Monitoring snapshot progress...
+2025-07-29 19:25:21 - INFO - Snapshot completed successfully in 30.2 seconds
 ------------------------------------------------------------
-2025-07-29 19:24:48 - INFO - Setup completed successfully!
+2025-07-29 19:25:21 - INFO - === Setup Summary ===
+2025-07-29 19:25:21 - INFO - S3 bucket: opensearch-snapshots-8cc57667
+2025-07-29 19:25:21 - INFO - Repository: manualsnap-repo-a7b2
+2025-07-29 19:25:21 - INFO - Snapshot: manual-snapshot-20250109-143022
+2025-07-29 19:25:21 - INFO - Source role: OpenSearchSnapshotRole-src
+2025-07-29 19:25:21 - INFO - Source user: OpenSearchSnapshotUser-src
+2025-07-29 19:25:21 - INFO - Destination role: OpenSearchSnapshotRole-dest
+2025-07-29 19:25:21 - INFO - Destination user: OpenSearchSnapshotUser-dest
+------------------------------------------------------------
+2025-07-29 19:25:21 - INFO - Setup and snapshot completed successfully!
 ```
 
 ## How to Get ARNs
@@ -260,20 +307,30 @@ python opensearch_snapshot_setup.py \
 
 ## Next Steps After Running
 
-### Default Behavior (Repository Registered)
-The script automatically registers the snapshot repository by default, so you can proceed directly to testing:
+### Default Behavior (Complete Setup + Snapshot)
+The script automatically creates a snapshot by default, so you can proceed directly to restoration:
 
 ```bash
-# Create snapshot
-curl -X PUT "https://source-domain-endpoint/_snapshot/automated-snapshots/snapshot-1" \
+# Check existing snapshots (using the generated repository name from config)
+curl -X GET "https://source-domain-endpoint/_snapshot/manualsnap-repo-a7b2/_all"
+
+# Create additional snapshots if needed
+curl -X PUT "https://source-domain-endpoint/_snapshot/manualsnap-repo-a7b2/my-custom-snapshot" \
   -H "Content-Type: application/json" \
   -d '{"indices": "*", "ignore_unavailable": true, "include_global_state": false}'
 
-# Check snapshot status
-curl -X GET "https://source-domain-endpoint/_snapshot/automated-snapshots/snapshot-1"
-
 # Restore snapshot in destination domain (register repository first in destination)
-curl -X POST "https://dest-domain-endpoint/_snapshot/automated-snapshots/snapshot-1/_restore" \
+curl -X POST "https://dest-domain-endpoint/_snapshot/manualsnap-repo-a7b2/manual-snapshot-20250109-143022/_restore" \
+  -H "Content-Type: application/json" \
+  -d '{"indices": "*", "ignore_unavailable": true, "include_global_state": false}'
+```
+
+### If you used `--skip-snapshot`
+You can create snapshots manually using the generated repository:
+
+```bash
+# Create snapshot using the repository from config file
+curl -X PUT "https://source-domain-endpoint/_snapshot/manualsnap-repo-a7b2/my-snapshot" \
   -H "Content-Type: application/json" \
   -d '{"indices": "*", "ignore_unavailable": true, "include_global_state": false}'
 ```
@@ -282,8 +339,8 @@ curl -X POST "https://dest-domain-endpoint/_snapshot/automated-snapshots/snapsho
 You need to manually register the snapshot repository:
 
 ```bash
-# Register repository in source domain
-curl -X PUT "https://source-domain-endpoint/_snapshot/automated-snapshots" \
+# Register repository in source domain (use repository name from config)
+curl -X PUT "https://source-domain-endpoint/_snapshot/manualsnap-repo-a7b2" \
   -H "Content-Type: application/json" \
   -d '{
     "type": "s3",
@@ -295,7 +352,7 @@ curl -X PUT "https://source-domain-endpoint/_snapshot/automated-snapshots" \
   }'
 
 # Register repository in destination domain
-curl -X PUT "https://dest-domain-endpoint/_snapshot/automated-snapshots" \
+curl -X PUT "https://dest-domain-endpoint/_snapshot/manualsnap-repo-a7b2" \
   -H "Content-Type: application/json" \
   -d '{
     "type": "s3",
@@ -305,6 +362,21 @@ curl -X PUT "https://dest-domain-endpoint/_snapshot/automated-snapshots" \
       "role_arn": "arn:aws:iam::222222222222:role/OpenSearchSnapshotRole-dest"
     }
   }'
+```
+
+### Using the Standalone Scripts
+
+If you prefer to use the individual scripts after setup:
+
+```bash
+# Take additional snapshots using take_snapshot.py
+python take_snapshot.py \
+  --domain "https://source-domain-endpoint" \
+  --repository "manualsnap-repo-a7b2" \
+  --username admin --password mypassword
+
+# Clean up all resources using delete_all.py
+python delete_all.py --username admin --password mypassword
 ```
 
 ### Additional Setup (if needed)
@@ -508,14 +580,14 @@ The delete script removes all resources created by `opensearch_snapshot_setup.py
 2025-07-29 20:15:00 - INFO -   Destination IAM Role: OpenSearchSnapshotRole-dest
 2025-07-29 20:15:00 - INFO -   Destination IAM User: OpenSearchSnapshotUser-dest
 2025-07-29 20:15:00 - INFO -   OpenSearch Security Mappings (all_access, manage_snapshots)
-2025-07-29 20:15:00 - INFO -   Snapshot Repository: automated-snapshots
+2025-07-29 20:15:00 - INFO -   Snapshot Repository: manualsnap-repo-a7b2
 ------------------------------------------------------------
 
 Are you sure you want to delete these resources? (yes/no): yes
 
 ------------------------------------------------------------
 2025-07-29 20:15:05 - INFO - === Deleting Snapshot Repository ===
-2025-07-29 20:15:06 - INFO - Successfully deleted snapshot repository: automated-snapshots
+2025-07-29 20:15:06 - INFO - Successfully deleted snapshot repository: manualsnap-repo-a7b2
 ------------------------------------------------------------
 2025-07-29 20:15:06 - INFO - === Reverting OpenSearch Security Mappings ===
 2025-07-29 20:15:07 - INFO - Cleaned up all_access role mapping
@@ -569,36 +641,61 @@ This order ensures that OpenSearch security is properly cleaned up regardless of
 ## File Structure
 
 ```
-├── opensearch_snapshot_setup.py    # Main unified setup script
+├── opensearch_snapshot_setup.py    # Main unified setup and snapshot script
+├── take_snapshot.py                # Standalone snapshot creation script
 ├── delete_all.py                   # Complete cleanup script
-├── create_iam_resources.py         # Legacy IAM-only creation script
-├── configure_opensearch_security.py # Legacy security configuration script
-├── README.md                        # This file
+├── README.md                       # This file
 └── opensearch_snapshot_config.json # Generated output (after running setup script)
 ```
 
-## Migration from Legacy Scripts
+## Repository Name Management
 
-If you were using the separate `create_iam_resources.py` and `configure_opensearch_security.py` scripts, you can now use the unified script:
+The scripts use a shared repository naming system:
 
-### Old Way (2 scripts):
+- **Generation**: Repository names are randomly generated in format `manualsnap-repo-<4chars>` (e.g., `manualsnap-repo-a7b2`)
+- **Storage**: Repository name is saved in `opensearch_snapshot_config.json`
+- **Sharing**: All scripts (`opensearch_snapshot_setup.py`, `take_snapshot.py`, `delete_all.py`) use the same repository name
+- **Consistency**: Ensures all operations work with the same repository across the entire workflow
+
+## Workflow Options
+
+The project provides flexible workflow options:
+
+### Option 1: Complete End-to-End (Recommended)
 ```bash
-# Step 1: Create IAM resources
-python create_iam_resources.py --src-domain ... --dest-domain ...
-
-# Step 2: Configure security
-python configure_opensearch_security.py --username admin --password mypassword
-```
-
-### New Way (1 script):
-```bash
-# Single command does everything (IAM + Security + Repository)
+# Single command does everything (IAM + Security + Repository + Snapshot)
 python opensearch_snapshot_setup.py \
   --src-domain ... --dest-domain ... \
   --username admin --password mypassword
 ```
 
-The unified script provides the same functionality with additional features like smart S3 bucket management and automatic repository registration.
+### Option 2: Setup Only, Snapshots Later
+```bash
+# Step 1: Setup infrastructure
+python opensearch_snapshot_setup.py \
+  --src-domain ... --dest-domain ... \
+  --username admin --password mypassword \
+  --skip-snapshot
+
+# Step 2: Take snapshots as needed
+python take_snapshot.py \
+  --domain "https://source-domain-endpoint" \
+  --repository "manualsnap-repo-a7b2" \
+  --username admin --password mypassword
+```
+
+### Option 3: Modular Approach
+```bash
+# Setup without repository registration
+python opensearch_snapshot_setup.py \
+  --src-domain ... --dest-domain ... \
+  --username admin --password mypassword \
+  --skip-repository --skip-snapshot
+
+# Manual repository registration and snapshot creation as needed
+```
+
+The unified script provides enhanced functionality including unique repository naming, integrated snapshot creation, and shared configuration across all scripts.
 
 ## Contributing
 
